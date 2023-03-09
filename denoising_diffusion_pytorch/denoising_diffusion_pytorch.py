@@ -49,7 +49,9 @@ def identity(t, *args, **kwargs):
 def cycle(dl):
     while True:
         for data in dl:
-            yield data
+            if isinstance(data, dict):
+                yield data['IMG_TSE']
+            else: yield data
 
 def has_int_squareroot(num):
     return (math.sqrt(num) ** 2) == num
@@ -864,8 +866,10 @@ class Trainer(object):
 
         # dataset and dataloader
 
-        self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
-        dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
+        kds = KneeDataset()
+        self.ds = slice_preproc(kds)
+        # self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
+        dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = False, pin_memory = True, num_workers = cpu_count())
 
         dl = self.accelerator.prepare(dl)
         self.dl = cycle(dl)
@@ -993,14 +997,142 @@ class Trainer(object):
                         all_images = torch.cat(all_images_list, dim = 0)
 
                         utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow = int(math.sqrt(self.num_samples)))
-                        self.save(milestone)
+                        # self.save(milestone)
 
                         # whether to calculate fid
 
-                        if exists(self.inception_v3):
-                            fid_score = self.fid_score(real_samples = data, fake_samples = all_images)
-                            accelerator.print(f'fid_score: {fid_score}')
+                        # if exists(self.inception_v3):
+                        #     fid_score = self.fid_score(real_samples = data, fake_samples = all_images)
+                        #     accelerator.print(f'fid_score: {fid_score}')
 
                 pbar.update(1)
 
         accelerator.print('training complete')
+
+
+
+
+##### my garbo
+import os
+from collections import OrderedDict
+import ants
+import monai.transforms as MT
+import monai
+import torch
+from torch.utils.data import Dataset
+
+BONES = 'FTP'
+DATAROOT = '/home/yua4/nifti'
+SUFFIX = OrderedDict([
+    ('IMG_TSE',     'TSE.nii.gz'),
+    ('IMG_DESS',    'DESS.nii.gz'),
+    ('BMELT', 'BMELT_TSE.nii.gz'),
+    ('BMELCP', 'BMELCP_TSE.nii.gz'),
+    ('BONE',  'BONESEG_DESS.nii.gz'),
+    ('TBONE', 'TBONESEG_DESS.nii.gz'),
+    ('FBONE', 'FBONESEG_DESS.nii.gz'),
+])
+
+class Knee:
+    def __init__(self, base):
+        self.base = base
+        self.num_slices = 0
+        self.has_bmel = None
+
+        self.header = OrderedDict([(key, None) for key in SUFFIX])
+        self.path = OrderedDict([(key, None) for key in SUFFIX])
+
+        for key, val in SUFFIX.items():
+            path = os.path.join(DATAROOT, f'{self.base}-{val}')
+            if os.path.exists(path):
+                self.path[key] = path
+                self.header[key] = ants.image_header_info(path)
+                if key == 'IMG_TSE':
+                    self.num_slices = int(self.header[key]['dimensions'][0])
+                if key == 'BMELT' or key == 'BMELCP':
+                    self.has_bmel = True
+
+    def __getitem__(self, ndx):
+        return self.path[ndx]
+
+    def __repr__(self):
+        return f"Knee('{self.base}')"
+
+class KneeDataset(Dataset):
+    def __init__(self, knees=None):
+        if knees:
+            self.knees = knees
+        else:
+            bases = set('-'.join(f.split('-')[:-1]) for f in os.listdir('/home/yua4/nifti'))
+            self.knees = [Knee(base) for base in bases]
+
+    def __len__(self):
+        return len(self.knees)
+
+    def __getitem__(self, knee_ndx):
+        return self.knees[knee_ndx]
+
+    def split(self, split_val=0.8):
+        assert split_val > 0.0 and split_val < 1.0
+        cutoff = int(len(self.knees) * split_val)
+        test_split = self.knees[:cutoff]
+        val_split = self.knees[cutoff:]
+        return KneeDataset(test_split), KneeDataset(val_split)
+        
+def shift_zero_min(img):
+    img = img - img.min()
+    return img
+
+def slice_preproc(kds: KneeDataset, ki='IMG_TSE',ko='BMELT', q=1-1e-5):
+    """
+    standard per-dataset and per-volume preprocessing for knee dataset
+    `kds`: knee dataset
+    `ki`: key in
+    `ko`: key out
+    `q`: quantile
+    """
+    kds.knees = [k for k in kds.knees if k[ki] and k[ko]
+        and k.base not in (
+            'comet-patient-ccf-003-20210603-knee',
+            'comet-patient-ccf-015-20210920-knee',
+            'comet-patient-ccf-025-20220524-knee',
+        )
+    ]
+    files = [{ki: k[ki], ko: k[ko]} for k in kds]
+
+    # per-volume quantiles
+    transforms = MT.Compose([
+        MT.LoadImaged([ki, ko]),
+        MT.EnsureChannelFirstd([ki, ko]),
+        MT.CastToTyped(ko, dtype=bool),
+        MT.CastToTyped([ki, ko], dtype=torch.float32),
+        MT.Resized([ki, ko], spatial_size=(-1, 320, 320), anti_aliasing=True),
+        MT.NormalizeIntensityd(ki),
+        MT.Lambdad([ki, ko], shift_zero_min),
+    ])
+    mds = monai.data.Dataset(data=files, transform=transforms)
+    ### takes like 20 seconds!
+    a_max = max(torch.quantile(k[ki], q) for k in mds)
+
+    # per-volume transforms
+    transforms2 = MT.Compose([
+        MT.ScaleIntensityRanged(ki, a_min=0, a_max=a_max, b_min=0, b_max=1, clip=True),
+        MT.CenterSpatialCropd([ki, ko], roi_size=(-1, 256, 256)),
+        MT.EnsureTyped([ki, ko]),
+        # Lambdad([K_IN, K_OUT], show_img)
+    ])
+    mds2 = monai.data.Dataset(data=mds, transform=transforms2)
+
+    slice_func = monai.data.PatchIterd(
+        keys=[ki, ko],
+        patch_size=(1, None, None),  # dynamic first two dimensions
+        start_pos=(0, 0, 0),
+    )
+    # per-slice transforms
+    slice_transform = MT.Compose([
+        MT.SqueezeDimd(keys=[ki, ko], dim=0),  # squeeze the last dim
+    ])
+    slice_ds = monai.data.GridPatchDataset(
+        data=mds2, patch_iter=slice_func, transform=slice_transform, with_coordinates=False)
+    
+    return slice_ds
